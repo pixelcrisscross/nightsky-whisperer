@@ -1,0 +1,1194 @@
+"""NightSky Whisperer phone bridge, astronomy, guidance, and LED matrix API (v0.6.0)."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import tempfile
+import time
+import wave
+from collections import deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from audio_transport import (
+    CHANNELS as AUDIO_CHANNELS, MAX_AUDIO_BYTES, MAX_AUDIO_SECONDS, SAMPLE_RATE_HZ as AUDIO_SAMPLE_RATE_HZ,
+    iter_pcm_chunks, normalize_pcm16, write_pcm_wav,
+)
+from pydantic import BaseModel
+
+from astro_engine import BRIGHT_STARS, nearest_bright_stars, radec_to_altaz, visible_bright_stars
+from calibration import HeadingCalibration, circular_mean_deg, wrap180
+from sky_engine import compute_pointing
+from target_guidance import calculate_guidance
+from matrix_bridge import MATRIX_DIRECTIONS, RouterRPCClient, validate_direction
+
+CALIBRATION_PATH = Path(os.getenv(
+    "NIGHTSKY_CALIBRATION_PATH",
+    str(Path.home() / "nightsky-whisperer" / "heading_calibration.json"),
+))
+CALIBRATION = HeadingCalibration(CALIBRATION_PATH)
+
+STATE: dict[str, Any] = {
+    "started_at": time.time(),
+    "connected_clients": 0,
+    "latest_telemetry": None,
+    "latest_received_at": None,
+    "telemetry_count": 0,
+    "selected_target_id": None,
+    "target_selected_at_unix": None,
+}
+# Keep a short recent history so a calibration capture can average several stable
+# sensor updates instead of trusting one possibly noisy compass sample.
+TELEMETRY_HISTORY: deque[tuple[float, dict[str, Any]]] = deque(maxlen=100)
+_state_lock = asyncio.Lock()
+
+
+class CardinalCaptureRequest(BaseModel):
+    direction: str
+
+
+class TargetSelectRequest(BaseModel):
+    target: str
+
+
+class MatrixShowRequest(BaseModel):
+    direction: str
+
+
+class MatrixFollowRequest(BaseModel):
+    enabled: bool
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    print("NightSky Whisperer phone bridge starting (v0.6.0)")
+    print(f"Heading calibration file: {CALIBRATION_PATH}")
+    worker = asyncio.create_task(_matrix_auto_follow_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        print("NightSky Whisperer phone bridge stopping")
+
+
+app = FastAPI(
+    title="NightSky Whisperer Phone Bridge",
+    version="0.6.0",
+    lifespan=lifespan,
+)
+
+MATRIX_RPC = RouterRPCClient()
+MATRIX_STATE: dict[str, Any] = {
+    "auto_follow_enabled": False,
+    "last_command": None,
+    "last_command_at_unix": None,
+    "last_result": None,
+    "last_error": None,
+    "commands_sent": 0,
+}
+MATRIX_STATE_LOCK = asyncio.Lock()
+MATRIX_AUTO_FOLLOW_INTERVAL_SECONDS = 0.25
+AUDIO_DIR = Path(os.getenv("NIGHTSKY_AUDIO_DIR", str(Path.home() / "nightsky-whisperer" / "audio")))
+AUDIO_LATEST_WAV = AUDIO_DIR / "latest_mic.wav"
+WHISPER_BIN = Path(os.getenv(
+    "NIGHTSKY_WHISPER_BIN",
+    str(Path.home() / "whisper.cpp" / "build" / "bin" / "whisper-cli"),
+))
+WHISPER_MODEL = Path(os.getenv(
+    "NIGHTSKY_WHISPER_MODEL",
+    str(Path.home() / "nightsky-whisperer" / "models" / "ggml-tiny.en.bin"),
+))
+LLAMA_BIN = Path(os.getenv(
+    "NIGHTSKY_LLAMA_BIN",
+    str(Path.home() / "llama.cpp" / "build" / "bin" / "llama-cli"),
+))
+GEMMA_MODEL = Path(os.getenv(
+    "NIGHTSKY_GEMMA_MODEL",
+    str(Path.home() / "nightsky-whisperer" / "models" / "gemma-3-1b-it-Q4_K_M.gguf"),
+))
+PIPER_BIN = Path(os.getenv(
+    "NIGHTSKY_PIPER_BIN",
+    str(Path.home() / "nightsky-whisperer" / ".venv" / "bin" / "piper"),
+))
+PIPER_MODEL = Path(os.getenv(
+    "NIGHTSKY_PIPER_MODEL",
+    str(Path.home() / "nightsky-whisperer" / "models" / "en_GB-alba-medium.onnx"),
+))
+AUDIO_STATE: dict[str, Any] = {
+    "capture_active": False,
+    "last_recording_path": None,
+    "last_recording_bytes": 0,
+    "last_recording_seconds": 0.0,
+    "last_error": None,
+    "last_transcription": None,
+    "last_transcription_at": None,
+    "last_transcription_error": None,
+    "last_assistant_response": None,
+    "last_assistant_error": None,
+}
+
+
+def _run_whisper_cli(audio_path: Path) -> dict[str, Any]:
+    """Transcribe a saved WAV with the existing local Whisper installation."""
+    if not WHISPER_BIN.is_file():
+        return {"ok": False, "error": f"Whisper executable not found: {WHISPER_BIN}"}
+    if not WHISPER_MODEL.is_file():
+        return {"ok": False, "error": f"Whisper model not found: {WHISPER_MODEL}"}
+
+    try:
+        result = subprocess.run(
+            [
+                str(WHISPER_BIN),
+                "-m", str(WHISPER_MODEL),
+                "-f", str(audio_path),
+                "--no-timestamps",
+                "--no-prints",
+                "-t", "4",
+                "-l", "en",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Whisper transcription timed out after 60 seconds."}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not run Whisper: {exc}"}
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-1500:]
+        return {
+            "ok": False,
+            "error": f"Whisper exited with code {result.returncode}: {detail}",
+        }
+
+    transcript = result.stdout.strip().replace("[BLANK_AUDIO]", "").strip()
+    return {"ok": True, "text": transcript}
+
+
+def _run_gemma_cli(user_text: str) -> dict[str, Any]:
+    """Generate a short spoken-style response using the existing local Gemma model."""
+    if not LLAMA_BIN.is_file():
+        return {"ok": False, "error": f"llama-cli not found: {LLAMA_BIN}"}
+    if not GEMMA_MODEL.is_file():
+        return {"ok": False, "error": f"Gemma model not found: {GEMMA_MODEL}"}
+
+    prompt = (
+        "You are NightSky Whisperer, a friendly offline astronomy companion. "
+        "Answer in one to three concise sentences suitable for speech. "
+        "Be clear and factual. Do not invent live sky conditions or claim to "
+        "know the user's current pointing or location unless that data is supplied. "
+        "Voice navigation controls are not yet connected to your reply, so never "
+        "claim that you moved the LED pointer or completed a navigation action. "
+        f"The user said: {user_text}"
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                str(LLAMA_BIN),
+                "--single-turn",
+                "--simple-io",
+                "-m", str(GEMMA_MODEL),
+                "-p", prompt,
+                "-n", "100",
+                "-t", "4",
+                "-c", "2048",
+                "--temp", "0.2",
+                "--no-display-prompt",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Gemma timed out after 120 seconds."}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not run Gemma: {exc}"}
+
+    output = result.stdout or ""
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "error": f"llama-cli exited with code {result.returncode}: {output[-1200:]}",
+        }
+
+    # llama-cli may echo the prompt, so locate its final user-text anchor.
+    # Using a short suffix also tolerates line wrapping in longer prompts.
+    anchor = user_text.strip()
+    if anchor and anchor in output:
+        position = output.find(anchor)
+        candidate = output[position + len(anchor):]
+    else:
+        anchor = user_text.strip()[-min(24, len(user_text.strip())):]
+        position = output.find(anchor) if anchor else -1
+        if position >= 0:
+            candidate = output[position + len(anchor):]
+        else:
+            return {
+                "ok": False,
+                "error": "Could not locate the echoed user prompt in llama-cli output.",
+            }
+
+    # Keep the generated response; discard CLI performance/status lines.
+    candidate = candidate.split("[ Prompt:", 1)[0]
+    candidate = candidate.split("Exiting...", 1)[0].strip()
+
+    # Remove any leftover blank lines without disturbing sentence punctuation.
+    response_lines = [line.strip() for line in candidate.splitlines() if line.strip()]
+    response = " ".join(response_lines).strip()
+
+    if not response:
+        return {
+            "ok": False,
+            "error": f"Gemma produced no extractable response. Output tail: {output[-800:]}",
+        }
+
+    return {"ok": True, "text": response}
+
+def _run_piper_cli(text: str) -> dict[str, Any]:
+    """Synthesize speech to mono PCM16 using the existing Alba voice."""
+    if not text.strip():
+        return {"ok": False, "error": "No text supplied to Piper."}
+    if not PIPER_BIN.is_file():
+        return {"ok": False, "error": f"Piper executable not found: {PIPER_BIN}"}
+    if not PIPER_MODEL.is_file():
+        return {"ok": False, "error": f"Piper voice model not found: {PIPER_MODEL}"}
+
+    fd, output_path = tempfile.mkstemp(prefix="nightsky-tts-", suffix=".wav")
+    os.close(fd)
+
+    try:
+        result = subprocess.run(
+            [
+                str(PIPER_BIN),
+                "--model", str(PIPER_MODEL),
+                "--output_file", output_path,
+            ],
+            input=text.strip().encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            detail = (result.stdout or b"").decode(
+                "utf-8", errors="replace"
+            )[-1200:]
+            return {
+                "ok": False,
+                "error": f"Piper exited with code {result.returncode}: {detail}",
+            }
+
+        with wave.open(output_path, "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            sample_rate = wav.getframerate()
+            frame_count = wav.getnframes()
+            pcm = wav.readframes(frame_count)
+
+        if channels != 1 or sample_width != 2:
+            return {
+                "ok": False,
+                "error": (
+                    f"Expected mono PCM16 from Piper; got "
+                    f"{channels} channel(s), {sample_width * 8}-bit audio."
+                ),
+            }
+        if not pcm or sample_rate <= 0:
+            return {"ok": False, "error": "Piper produced empty or invalid audio."}
+
+        return {
+            "ok": True,
+            "pcm": pcm,
+            "sample_rate_hz": sample_rate,
+            "duration_seconds": len(pcm) / (sample_rate * 2),
+        }
+
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Piper timed out after 60 seconds."}
+    except Exception as exc:
+        return {"ok": False, "error": f"Piper synthesis failed: {exc}"}
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+
+def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
+    """Transcribe, generate a reply, and synthesize it as speech."""
+    transcription = _run_whisper_cli(audio_path)
+    if not transcription.get("ok"):
+        return transcription
+
+    recognized_text = str(transcription.get("text", "")).strip()
+
+    if not recognized_text:
+        response_text = (
+            "Sorry, I couldn't make out what you said. Please try again."
+        )
+        response_ok = True
+        response_error = None
+    else:
+        generated = _run_gemma_cli(recognized_text)
+        if generated.get("ok"):
+            response_text = str(generated.get("text", "")).strip()
+            response_ok = bool(response_text)
+            response_error = None
+            if not response_text:
+                response_text = "Sorry, I couldn't generate a response."
+        else:
+            response_text = (
+                "I recognized your words, but couldn't generate a reply "
+                "with my local language model."
+            )
+            response_ok = False
+            response_error = str(generated.get("error", "Unknown Gemma error"))
+
+    speech = _run_piper_cli(response_text)
+
+    outcome = {
+        "ok": True,
+        "text": recognized_text,
+        "response": response_text,
+        "response_ok": response_ok,
+        "response_error": response_error,
+        "speech_ok": bool(speech.get("ok")),
+        "speech_sample_rate_hz": speech.get("sample_rate_hz"),
+        "speech_duration_seconds": speech.get("duration_seconds"),
+        "speech_error": speech.get("error"),
+    }
+
+    if speech.get("ok"):
+        outcome["speech_pcm"] = speech["pcm"]
+
+    return outcome
+
+
+async def _transcribe_wav_async(audio_path: Path) -> dict[str, Any]:
+    """Keep speech and language-model inference off the WebSocket event loop."""
+    return await asyncio.to_thread(_run_voice_pipeline, audio_path)
+
+
+
+def _apply_heading_calibration(pointing: dict[str, Any], offset: float | None) -> dict[str, Any]:
+    """Annotate pointing response and correct the selected top-edge azimuth only."""
+    result = dict(pointing)
+    if not result.get("available"):
+        return result
+    top = dict(result.get("top_edge") or {})
+    raw = top.get("true_azimuth_deg")
+    top["raw_true_azimuth_deg"] = raw
+    top["heading_calibration_applied"] = offset is not None and raw is not None
+    if raw is not None and offset is not None:
+        top["true_azimuth_deg"] = round((float(raw) + offset) % 360.0, 3)
+    result["top_edge"] = top
+    result["calibration_required"] = offset is None
+    return result
+
+
+async def _current_observer_state() -> tuple[dict[str, Any] | None, float | None]:
+    async with _state_lock:
+        telemetry = STATE["latest_telemetry"]
+        received_at = STATE["latest_received_at"]
+    return telemetry, received_at
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {
+        "name": "NightSky Whisperer Phone Bridge",
+        "version": "0.6.0",
+        "health": "/health",
+        "latest_telemetry": "/latest",
+        "pointing": "/pointing",
+        "calibration": "/calibration",
+        "websocket": "/ws/phone",
+        "target_select": "/target/select",
+        "target_guidance": "/target/guidance",
+        "matrix_status": "/matrix/status",
+        "matrix_show": "/matrix/show",
+        "matrix_auto_follow": "/matrix/auto-follow",
+        "audio_status": "/audio/status",
+    }
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    async with _state_lock:
+        latest_at = STATE["latest_received_at"]
+        result = {
+            "ok": True,
+            "service": "nightsky-phone-bridge",
+            "version": "0.6.0",
+            "connected_clients": STATE["connected_clients"],
+            "telemetry_count": STATE["telemetry_count"],
+            "telemetry_age_seconds": round(time.time() - latest_at, 2) if latest_at else None,
+            "uptime_seconds": round(time.time() - STATE["started_at"], 2),
+        }
+    return JSONResponse(result)
+
+
+@app.get("/latest")
+async def latest() -> dict[str, Any]:
+    async with _state_lock:
+        telemetry = STATE["latest_telemetry"]
+        received_at = STATE["latest_received_at"]
+    return {"available": telemetry is not None, "received_at_unix": received_at, "telemetry": telemetry}
+
+
+@app.get("/pointing")
+async def pointing() -> dict[str, Any]:
+    telemetry, received_at = await _current_observer_state()
+    if not telemetry:
+        return {"available": False, "message": "No phone telemetry yet. Connect the Android app first."}
+    orientation = telemetry.get("orientation") or {}
+    location = telemetry.get("location") or {}
+    raw_result = compute_pointing(
+        orientation.get("rotation_vector"),
+        magnetic_declination_deg=orientation.get("magnetic_declination_deg"),
+    )
+    result = _apply_heading_calibration(raw_result, CALIBRATION.valid_offset())
+    result.update({
+        "received_at_unix": received_at,
+        "location": {
+            "latitude_deg": location.get("latitude_deg"),
+            "longitude_deg": location.get("longitude_deg"),
+            "accuracy_m": location.get("accuracy_m"),
+        },
+        "heading_calibration": CALIBRATION.status(),
+        "north_reference_note": (
+            "true_azimuth_deg includes Android's magnetic-declination estimate; after validation, "
+            "the calibrated constant heading offset is applied. Check magnetic interference with the assembled device."
+        ),
+    })
+    if result.get("available"):
+        result["calibration_note"] = (
+            "Heading calibrated. Confirm outdoors with the assembled device before relying on star acquisition."
+            if not result.get("calibration_required") else
+            "Calibration required: capture at least three independently verified cardinal directions; four is recommended."
+        )
+    return result
+
+
+@app.get("/calibration")
+async def calibration_status() -> dict[str, Any]:
+    return CALIBRATION.status()
+
+
+@app.post("/calibration/capture")
+async def calibration_capture(request: CardinalCaptureRequest) -> dict[str, Any]:
+    direction = request.direction.strip().lower()
+    if direction not in {"north", "east", "south", "west"}:
+        raise HTTPException(status_code=422, detail="direction must be north, east, south, or west")
+
+    now = time.time()
+    async with _state_lock:
+        recent = [(received_at, message) for received_at, message in TELEMETRY_HISTORY
+                  if now - received_at <= 2.5]
+    readings: list[tuple[float, float]] = []
+    for _, message in recent:
+        orientation = message.get("orientation") or {}
+        result = compute_pointing(
+            orientation.get("rotation_vector"),
+            magnetic_declination_deg=orientation.get("magnetic_declination_deg"),
+        )
+        if not result.get("available"):
+            continue
+        axis = result.get("top_edge") or {}
+        azimuth = axis.get("true_azimuth_deg")
+        elevation = axis.get("elevation_deg")
+        if azimuth is None or elevation is None:
+            continue
+        # For a horizontal cardinal capture, reject tilted samples rather than
+        # averaging a compass bearing that is undefined near vertical.
+        if abs(float(elevation)) <= 10.0:
+            readings.append((float(azimuth), float(elevation)))
+
+    if len(readings) < 5:
+        raise HTTPException(
+            status_code=422,
+            detail=("Not enough recent horizontal samples. Keep the phone connected, hold its top edge "
+                    "horizontal toward the reference direction for 2–3 seconds, then capture again."),
+        )
+    try:
+        mean_azimuth, _ = circular_mean_deg([r[0] for r in readings])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Unstable heading samples: {exc}") from exc
+    spread = max(abs(wrap180(r[0] - mean_azimuth)) for r in readings)
+    mean_elevation = sum(r[1] for r in readings) / len(readings)
+    if spread > 8.0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Heading is unstable (spread {spread:.1f}°). Hold the assembled phone still and retry.",
+        )
+    if abs(mean_elevation) > 10.0:
+        raise HTTPException(status_code=422, detail="The phone's top edge must be horizontal within ±10°.")
+
+    try:
+        result = CALIBRATION.add_capture(
+            direction=direction,
+            measured_true_azimuth_deg=mean_azimuth,
+            elevation_deg=mean_elevation,
+            sample_count=len(readings),
+            spread_deg=spread,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result["last_capture"] = result["captures"].get(direction)
+    return result
+
+
+@app.post("/calibration/reset")
+async def calibration_reset() -> dict[str, Any]:
+    CALIBRATION.reset()
+    return CALIBRATION.status()
+
+
+@app.get("/sky/catalog")
+async def sky_catalog() -> dict[str, Any]:
+    return {
+        "available": True,
+        "catalog_type": "curated_bright_stars_v1",
+        "count": len(BRIGHT_STARS),
+        "objects": BRIGHT_STARS,
+        "limitation": "Bright stars only; constellation boundary matching and planetary ephemerides are not yet implemented.",
+    }
+
+
+@app.get("/sky/visible")
+async def sky_visible(limit: int = 25) -> dict[str, Any]:
+    telemetry, received_at = await _current_observer_state()
+    if not telemetry:
+        return {"available": False, "message": "Connect the Android app and wait for telemetry."}
+    loc = telemetry.get("location") or {}
+    try:
+        latitude = float(loc["latitude_deg"])
+        longitude = float(loc["longitude_deg"])
+        timestamp = float(telemetry.get("ts_unix_ms", 0)) / 1000.0
+        if timestamp <= 0:
+            timestamp = float(received_at or time.time())
+        objects = visible_bright_stars(latitude, longitude, timestamp)
+        limit = max(1, min(int(limit), 100))
+        return {
+            "available": True,
+            "timestamp_unix": timestamp,
+            "observer": {"latitude_deg": latitude, "longitude_deg": longitude,
+                         "location_accuracy_m": loc.get("accuracy_m")},
+            "visible_count": len(objects),
+            "objects": objects[:limit],
+            "note": "Geometric horizon only; no refraction, terrain/horizon mask, twilight, cloud, or glare model.",
+        }
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return {"available": False, "error": f"Invalid or unavailable observer telemetry: {exc}"}
+
+
+@app.get("/sky/nearest")
+async def sky_nearest(limit: int = 5) -> dict[str, Any]:
+    telemetry, received_at = await _current_observer_state()
+    if not telemetry:
+        return {"available": False, "message": "Connect the Android app and wait for telemetry."}
+    orientation = telemetry.get("orientation") or {}
+    location = telemetry.get("location") or {}
+    raw_pointing = compute_pointing(
+        orientation.get("rotation_vector"),
+        magnetic_declination_deg=orientation.get("magnetic_declination_deg"),
+    )
+    if not raw_pointing.get("available"):
+        return {"available": False, "error": raw_pointing.get("error", "Pointing is unavailable")}
+    try:
+        latitude = float(location["latitude_deg"])
+        longitude = float(location["longitude_deg"])
+        axis = raw_pointing["top_edge"]
+        raw_azimuth = axis.get("true_azimuth_deg")
+        if raw_azimuth is None:
+            raw_azimuth = axis["magnetic_or_sensor_azimuth_deg"]
+        raw_azimuth = float(raw_azimuth)
+        altitude = float(axis["elevation_deg"])
+        heading_offset = CALIBRATION.valid_offset()
+        azimuth = (raw_azimuth + heading_offset) % 360.0 if heading_offset is not None else raw_azimuth
+        timestamp = float(telemetry.get("ts_unix_ms", 0)) / 1000.0
+        if timestamp <= 0:
+            timestamp = float(received_at or time.time())
+        ranked = nearest_bright_stars(latitude, longitude, timestamp, float(azimuth), altitude, limit=limit)
+        ranked.update({
+            "calibration_required": heading_offset is None,
+            "heading_calibration": CALIBRATION.status(),
+            "raw_pointing": {
+                "azimuth_deg": round(raw_azimuth % 360.0, 3),
+                "altitude_deg": round(altitude, 3),
+            },
+            "pointing": {
+                "azimuth_deg": round(azimuth % 360.0, 3),
+                "altitude_deg": round(altitude, 3),
+                "heading_calibration_applied": heading_offset is not None,
+            },
+            "pointing_axis": "top_edge",
+            "pointing_source": "calibrated_true_azimuth" if heading_offset is not None else "uncalibrated_true_azimuth",
+            "timestamp_unix": timestamp,
+            "observer": {"latitude_deg": latitude, "longitude_deg": longitude,
+                         "location_accuracy_m": location.get("accuracy_m")},
+        })
+        if heading_offset is None:
+            ranked["warning"] = (
+                "Diagnostic only: compass/cardinal calibration has not been validated. Do not use nearest-star "
+                "results for target acquisition yet. This endpoint ranks bright stars only, not constellations or planets."
+            )
+        else:
+            ranked["warning"] = (
+                "Heading offset has passed the cardinal consistency check. Still verify outdoors with the assembled "
+                "device; results are bright-star candidates, not constellation recognition or planetary positions."
+            )
+        return ranked
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return {"available": False, "error": f"Cannot calculate nearest targets: {exc}"}
+
+
+@app.get("/target")
+async def target_status() -> dict[str, Any]:
+    """Return the currently selected catalogue target, if any."""
+    async with _state_lock:
+        target_id = STATE["selected_target_id"]
+        selected_at = STATE["target_selected_at_unix"]
+    if not target_id:
+        return {
+            "available": True,
+            "selected": False,
+            "message": "No target selected. POST /target/select with a bright-star name or ID.",
+            "available_target_count": len(BRIGHT_STARS),
+        }
+    target = next((obj for obj in BRIGHT_STARS if obj["id"] == target_id), None)
+    return {"available": target is not None, "selected": target is not None,
+            "target": target, "selected_at_unix": selected_at}
+
+
+@app.post("/target/select")
+async def target_select(request: TargetSelectRequest) -> dict[str, Any]:
+    """Select a bright-star target by ID or case-insensitive display name."""
+    requested = request.target.strip().casefold()
+    if not requested:
+        raise HTTPException(status_code=422, detail="target must not be empty")
+    target = next((obj for obj in BRIGHT_STARS
+                   if obj["id"].casefold() == requested or obj["name"].casefold() == requested), None)
+    if target is None:
+        matches = [obj["name"] for obj in BRIGHT_STARS if requested in obj["name"].casefold()]
+        detail = "Unknown target. This version supports the curated bright-star catalog only."
+        if matches:
+            detail += " Possible matches: " + ", ".join(matches)
+        raise HTTPException(status_code=404, detail=detail)
+    async with _state_lock:
+        STATE["selected_target_id"] = target["id"]
+        STATE["target_selected_at_unix"] = time.time()
+    return {
+        "available": True,
+        "selected": True,
+        "target": target,
+        "message": f"Target selected: {target['name']}. Query /target/guidance for pointing directions.",
+    }
+
+
+@app.post("/target/clear")
+async def target_clear() -> dict[str, Any]:
+    async with _state_lock:
+        STATE["selected_target_id"] = None
+        STATE["target_selected_at_unix"] = None
+    return {"available": True, "selected": False, "message": "Target cleared."}
+
+
+@app.get("/target/guidance")
+async def target_guidance(acquisition_radius_deg: float = 2.0) -> dict[str, Any]:
+    """Return calibrated coarse steering guidance for the selected bright star.
+
+    Direction labels use local sky azimuth/elevation deltas, not yet the physical
+    LED matrix's display coordinate frame. Keep that distinction until an LED
+    orientation/mounting convention is verified on the real assembly.
+    """
+    if not 0.5 <= acquisition_radius_deg <= 5.0:
+        raise HTTPException(status_code=422, detail="acquisition_radius_deg must be between 0.5 and 5.0")
+    telemetry, received_at = await _current_observer_state()
+    if not telemetry:
+        return {"available": False, "error": "no_phone_telemetry", "message": "Connect the Android app first."}
+
+    async with _state_lock:
+        target_id = STATE["selected_target_id"]
+    if not target_id:
+        return {"available": False, "error": "no_target_selected", "message": "POST /target/select first."}
+
+    age = time.time() - float(received_at or 0.0)
+    if received_at is None or age > 3.0:
+        return {"available": False, "error": "telemetry_stale", "telemetry_age_seconds": round(age, 2),
+                "message": "Phone telemetry is stale. Reconnect the phone bridge before guiding."}
+
+    heading_offset = CALIBRATION.valid_offset()
+    if heading_offset is None:
+        return {"available": False, "error": "calibration_required", "heading_calibration": CALIBRATION.status(),
+                "message": "Capture and validate at least three independent cardinal directions before target guidance."}
+
+    target = next((obj for obj in BRIGHT_STARS if obj["id"] == target_id), None)
+    if target is None:
+        return {"available": False, "error": "selected_target_missing"}
+
+    orientation = telemetry.get("orientation") or {}
+    location = telemetry.get("location") or {}
+    pointing = compute_pointing(
+        orientation.get("rotation_vector"),
+        magnetic_declination_deg=orientation.get("magnetic_declination_deg"),
+    )
+    if not pointing.get("available"):
+        return {"available": False, "error": pointing.get("error", "Pointing unavailable")}
+
+    try:
+        latitude = float(location["latitude_deg"])
+        longitude = float(location["longitude_deg"])
+        axis = pointing["top_edge"]
+        raw_azimuth = axis.get("true_azimuth_deg")
+        if raw_azimuth is None:
+            return {"available": False, "error": "true_north_unavailable",
+                    "message": "Android magnetic declination is unavailable; do not guide using an unverified north reference."}
+        current_az = (float(raw_azimuth) + heading_offset) % 360.0
+        current_alt = float(axis["elevation_deg"])
+        timestamp = float(telemetry.get("ts_unix_ms", 0)) / 1000.0
+        if timestamp <= 0:
+            timestamp = float(received_at)
+        target_horizontal = radec_to_altaz(target["ra_deg"], target["dec_deg"], latitude, longitude, timestamp)
+        result = calculate_guidance(
+            current_azimuth_deg=current_az,
+            current_altitude_deg=current_alt,
+            target_azimuth_deg=target_horizontal["azimuth_deg"],
+            target_altitude_deg=target_horizontal["altitude_deg"],
+            acquisition_radius_deg=acquisition_radius_deg,
+        )
+        result.update({
+            "available": True,
+            "target": {**target, **target_horizontal},
+            "current_pointing": {"azimuth_deg": round(current_az, 3), "altitude_deg": round(current_alt, 3)},
+            "heading_calibration": {"applied": True, "offset_deg": round(heading_offset, 3),
+                                    "max_residual_deg": CALIBRATION.status().get("max_residual_deg")},
+            "observer": {"latitude_deg": latitude, "longitude_deg": longitude,
+                         "location_accuracy_m": location.get("accuracy_m")},
+            "timestamp_unix": timestamp,
+            "telemetry_age_seconds": round(age, 3),
+            "guidance_frame": "coarse dominant-axis azimuth/elevation hint; matrix symbols are implemented, but physical phone+board movement mapping still needs validation",
+            "safety_note": "Geometric star direction only. This does not confirm that a star is visually visible through clouds, daylight, glare, or obstructions.",
+        })
+        if target_horizontal["altitude_deg"] < 0.0:
+            result["direction"] = "target_below_horizon"
+            result["arrow"] = "—"
+            result["acquired"] = False
+            result["message"] = "This star is geometrically below the horizon at the current location/time."
+        return result
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return {"available": False, "error": f"Cannot calculate target guidance: {exc}"}
+
+
+async def _send_matrix_direction(direction: str) -> dict[str, Any]:
+    normalized = validate_direction(direction)
+    try:
+        result = await asyncio.to_thread(MATRIX_RPC.call, "show_direction", normalized)
+        async with MATRIX_STATE_LOCK:
+            MATRIX_STATE["last_command"] = normalized
+            MATRIX_STATE["last_command_at_unix"] = time.time()
+            MATRIX_STATE["last_result"] = result
+            MATRIX_STATE["last_error"] = None
+            MATRIX_STATE["commands_sent"] += 1
+        return {"available": True, "sent": True, "direction": normalized, "router_result": result}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        async with MATRIX_STATE_LOCK:
+            MATRIX_STATE["last_error"] = error
+        return {
+            "available": False,
+            "sent": False,
+            "direction": normalized,
+            "error": error,
+            "hint": "Confirm the NightSkyMatrixBridge App Lab sketch is running and has registered show_direction; check /var/run/arduino-router.sock.",
+        }
+
+
+@app.get("/matrix/status")
+async def matrix_status() -> dict[str, Any]:
+    async with MATRIX_STATE_LOCK:
+        state = dict(MATRIX_STATE)
+    return {
+        "available": True,
+        **state,
+        "router_socket": str(MATRIX_RPC.path),
+        "router_socket_exists": MATRIX_RPC.path.exists(),
+        "supported_directions": sorted(MATRIX_DIRECTIONS),
+        "firmware_required": True,
+        "note": "The physical matrix is controlled by an MCU sketch registered with Arduino Router Bridge.",
+    }
+
+
+@app.post("/matrix/show")
+async def matrix_show(request: MatrixShowRequest) -> dict[str, Any]:
+    try:
+        direction = validate_direction(request.direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await _send_matrix_direction(direction)
+
+
+@app.post("/matrix/auto-follow")
+async def matrix_auto_follow(request: MatrixFollowRequest) -> dict[str, Any]:
+    async with MATRIX_STATE_LOCK:
+        MATRIX_STATE["auto_follow_enabled"] = bool(request.enabled)
+    if not request.enabled:
+        idle_result = await _send_matrix_direction("idle")
+        return {"available": True, "auto_follow_enabled": False, "matrix_idle_result": idle_result}
+    return {
+        "available": True,
+        "auto_follow_enabled": True,
+        "message": "The server will send a new matrix command when the live guidance direction changes.",
+    }
+
+
+async def _matrix_auto_follow_worker() -> None:
+    """Optionally mirror named-target guidance to the physical matrix.
+
+    Sending is opt-in; no MCU requests are made until /matrix/auto-follow is enabled.
+    Repeated directions are deduplicated so high-rate sensor telemetry does not flood RPC.
+    """
+    last_direction: str | None = None
+    last_attempt_at = 0.0
+    while True:
+        await asyncio.sleep(MATRIX_AUTO_FOLLOW_INTERVAL_SECONDS)
+        async with MATRIX_STATE_LOCK:
+            enabled = bool(MATRIX_STATE["auto_follow_enabled"])
+            last_error = MATRIX_STATE["last_error"]
+        if not enabled:
+            last_direction = None
+            continue
+
+        guidance = await target_guidance()
+        if guidance.get("available"):
+            direction = guidance.get("direction", "idle")
+        else:
+            # A selected target with stale/invalid data should not leave an old
+            # directional command on screen. No-target defaults safely to idle.
+            direction = "idle"
+
+        if direction not in MATRIX_DIRECTIONS:
+            direction = "error"
+        if direction == last_direction:
+            continue
+        # If the MCU bridge is unavailable, retry slowly instead of opening a
+        # local socket at the sensor-update rate.
+        now = time.monotonic()
+        if last_error and now - last_attempt_at < 2.0:
+            continue
+        last_attempt_at = now
+        result = await _send_matrix_direction(direction)
+        if result.get("sent"):
+            last_direction = direction
+        else:
+            # Retry after the backoff period. Keep local display state unknown.
+            last_direction = None
+
+
+@app.get("/audio/status")
+async def audio_status() -> dict[str, Any]:
+    """Show the status of the most recent phone-mic loopback test."""
+    result = dict(AUDIO_STATE)
+    result.update({
+        "available": True,
+        "sample_rate_hz": AUDIO_SAMPLE_RATE_HZ,
+        "channels": AUDIO_CHANNELS,
+        "encoding": "pcm_s16le",
+        "max_recording_seconds": MAX_AUDIO_SECONDS,
+        "max_recording_bytes": MAX_AUDIO_BYTES,
+    })
+    return result
+
+
+@app.websocket("/ws/phone")
+async def phone_websocket(websocket: WebSocket) -> None:
+    await websocket.accept()
+    async with _state_lock:
+        STATE["connected_clients"] += 1
+    print(f"[phone] connected from {websocket.client}")
+    audio_capture: bytearray | None = None
+    audio_capture_started: float | None = None
+    pending_transcriptions: list[
+        tuple[asyncio.Task[dict[str, Any]], Path, float]
+    ] = []
+    try:
+        await websocket.send_json({
+            "type": "hello",
+            "protocol_version": 1,
+            "service": "nightsky-phone-bridge",
+            "message": "Connected. Send telemetry JSON; PCM16 audio uses binary frames.",
+        })
+        while True:
+            packet = await websocket.receive()
+            if packet.get("type") == "websocket.disconnect":
+                break
+
+            # Deliver finished transcription results from the main WebSocket
+            # loop, keeping outbound messages serialized with normal telemetry.
+            remaining_transcriptions = []
+            for task, source_path, source_duration in pending_transcriptions:
+                if not task.done():
+                    remaining_transcriptions.append(
+                        (task, source_path, source_duration)
+                    )
+                    continue
+
+                try:
+                    outcome = task.result()
+                except Exception as exc:
+                    outcome = {"ok": False, "error": str(exc)}
+
+                if outcome.get("ok"):
+                    transcript = str(outcome.get("text", "")).strip()
+                    AUDIO_STATE.update({
+                        "last_transcription": transcript,
+                        "last_transcription_at": time.time(),
+                        "last_transcription_error": None,
+                    })
+                    await websocket.send_json({
+                        "type": "transcription_result",
+                        "ok": True,
+                        "text": transcript,
+                        "audio_duration_seconds": source_duration,
+                    })
+                    print(f"[speech] transcription: {transcript!r}")
+
+                    response_text = str(outcome.get("response", "")).strip()
+                    if response_text:
+                        response_ok = bool(outcome.get("response_ok", True))
+                        response_error = outcome.get("response_error")
+                        AUDIO_STATE.update({
+                            "last_assistant_response": response_text,
+                            "last_assistant_error": response_error,
+                        })
+                        await websocket.send_json({
+                            "type": "assistant_response",
+                            "ok": response_ok,
+                            "input_text": transcript,
+                            "text": response_text,
+                        })
+                        print(f"[assistant] response: {response_text!r}")
+
+                        speech_pcm = outcome.get("speech_pcm")
+                        if isinstance(speech_pcm, bytes) and speech_pcm:
+                            speech_rate = int(
+                                outcome.get("speech_sample_rate_hz") or 22050
+                            )
+                            speech_duration = float(
+                                outcome.get("speech_duration_seconds")
+                                or len(speech_pcm) / (speech_rate * 2)
+                            )
+
+                            AUDIO_STATE.update({
+                                "last_speech_error": None,
+                                "last_speech_duration_seconds": round(
+                                    speech_duration, 3
+                                ),
+                            })
+
+                            # Android creates an AudioTrack from this sample rate.
+                            await websocket.send_json({
+                                "type": "audio_playback_start",
+                                "sample_rate_hz": speech_rate,
+                                "channels": 1,
+                                "encoding": "pcm_s16le",
+                                "duration_seconds": round(speech_duration, 3),
+                                "source": "piper_tts",
+                            })
+
+                            for chunk in iter_pcm_chunks(speech_pcm):
+                                await websocket.send_bytes(chunk)
+
+                            await websocket.send_json({
+                                "type": "audio_playback_end",
+                                "duration_seconds": round(speech_duration, 3),
+                                "source": "piper_tts",
+                            })
+                            print(
+                                f"[speech] streamed Piper audio: "
+                                f"{speech_duration:.2f}s at {speech_rate} Hz"
+                            )
+                        else:
+                            speech_error = str(
+                                outcome.get("speech_error")
+                                or "Piper returned no audio."
+                            )
+                            AUDIO_STATE["last_speech_error"] = speech_error
+                            print(f"[speech] TTS unavailable: {speech_error}")
+                else:
+                    error = str(outcome.get("error", "Unknown transcription error"))
+                    AUDIO_STATE["last_transcription_error"] = error
+                    await websocket.send_json({
+                        "type": "transcription_result",
+                        "ok": False,
+                        "text": "",
+                        "error": error,
+                        "audio_duration_seconds": source_duration,
+                    })
+                    print(f"[speech] transcription failed: {error}")
+
+            pending_transcriptions = remaining_transcriptions
+
+            binary_payload = packet.get("bytes")
+            if binary_payload is not None:
+                if audio_capture is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Received binary data without audio_start; send audio_start before PCM frames.",
+                    })
+                    continue
+                if len(audio_capture) + len(binary_payload) > MAX_AUDIO_BYTES:
+                    audio_capture = None
+                    audio_capture_started = None
+                    AUDIO_STATE.update({"capture_active": False, "last_error": "recording_limit_exceeded"})
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Recording exceeds {MAX_AUDIO_SECONDS} seconds; capture discarded.",
+                    })
+                    continue
+                audio_capture.extend(binary_payload)
+                continue
+
+            raw = packet.get("text")
+            if raw is None:
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
+            if not isinstance(message, dict):
+                await websocket.send_json({"type": "error", "message": "Message must be a JSON object"})
+                continue
+            message_type = message.get("type")
+            if message_type == "telemetry":
+                received_at = time.time()
+                async with _state_lock:
+                    STATE["latest_telemetry"] = message
+                    STATE["latest_received_at"] = received_at
+                    STATE["telemetry_count"] += 1
+                    TELEMETRY_HISTORY.append((received_at, message))
+                    count = STATE["telemetry_count"]
+                if count == 1 or count % 25 == 0:
+                    loc = message.get("location") or {}
+                    ori = message.get("orientation") or {}
+                    print(
+                        f"[telemetry #{count}] lat={loc.get('latitude_deg')} lon={loc.get('longitude_deg')} "
+                        f"heading={ori.get('phone_top_azimuth_deg')} pitch={ori.get('pitch_deg')} "
+                        f"roll={ori.get('roll_deg')} declination={ori.get('magnetic_declination_deg')}"
+                    )
+                if count == 1 or count % 25 == 0:
+                    await websocket.send_json({
+                        "type": "ack", "telemetry_count": count,
+                        "server_time_unix_ms": int(received_at * 1000),
+                    })
+            elif message_type == "ping":
+                await websocket.send_json({"type": "pong", "server_time_unix_ms": int(time.time() * 1000)})
+            elif message_type == "audio_start":
+                sample_rate = int(message.get("sample_rate_hz", 0))
+                channels = int(message.get("channels", 0))
+                encoding = str(message.get("encoding", ""))
+                if sample_rate != AUDIO_SAMPLE_RATE_HZ or channels != AUDIO_CHANNELS or encoding != "pcm_s16le":
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Audio format must be pcm_s16le, {AUDIO_SAMPLE_RATE_HZ} Hz, mono.",
+                    })
+                    continue
+                if audio_capture is not None:
+                    await websocket.send_json({"type": "error", "message": "Audio capture is already active."})
+                    continue
+                audio_capture = bytearray()
+                audio_capture_started = time.time()
+                AUDIO_STATE.update({"capture_active": True, "last_error": None})
+                await websocket.send_json({
+                    "type": "audio_started", "sample_rate_hz": AUDIO_SAMPLE_RATE_HZ,
+                    "channels": AUDIO_CHANNELS, "max_seconds": MAX_AUDIO_SECONDS,
+                })
+            elif message_type == "audio_stop":
+                if audio_capture is None:
+                    await websocket.send_json({"type": "error", "message": "No audio capture is active."})
+                    continue
+                pcm = normalize_pcm16(bytes(audio_capture))
+                started = audio_capture_started or time.time()
+                audio_capture = None
+                audio_capture_started = None
+                AUDIO_STATE["capture_active"] = False
+                if not pcm:
+                    AUDIO_STATE["last_error"] = "empty_recording"
+                    await websocket.send_json({"type": "error", "message": "No microphone audio was received."})
+                    continue
+                try:
+                    saved_path = write_pcm_wav(pcm, AUDIO_LATEST_WAV, AUDIO_SAMPLE_RATE_HZ)
+                except Exception as exc:
+                    AUDIO_STATE["last_error"] = f"save_failed: {exc}"
+                    await websocket.send_json({"type": "error", "message": f"Could not save audio: {exc}"})
+                    continue
+                duration = len(pcm) / (AUDIO_SAMPLE_RATE_HZ * AUDIO_CHANNELS * 2)
+                AUDIO_STATE.update({
+                    "last_recording_path": str(saved_path),
+                    "last_recording_bytes": len(pcm),
+                    "last_recording_seconds": round(duration, 3),
+                    "last_error": None,
+                })
+                await websocket.send_json({
+                    "type": "audio_saved", "path": str(saved_path),
+                    "pcm_bytes": len(pcm), "duration_seconds": round(duration, 3),
+                })
+                # Echo the captured PCM back to Android to verify phone-speaker playback.
+                await websocket.send_json({
+                    "type": "audio_playback_start", "sample_rate_hz": AUDIO_SAMPLE_RATE_HZ,
+                    "channels": AUDIO_CHANNELS, "encoding": "pcm_s16le",
+                    "duration_seconds": round(duration, 3), "source": "mic_loopback_test",
+                })
+                for audio_chunk in iter_pcm_chunks(pcm):
+                    await websocket.send_bytes(audio_chunk)
+                await websocket.send_json({
+                    "type": "audio_playback_end", "duration_seconds": round(duration, 3),
+                })
+
+                # Run Whisper concurrently with the ongoing phone telemetry.
+                pending_transcriptions.append((
+                    asyncio.create_task(_transcribe_wav_async(saved_path)),
+                    saved_path,
+                    round(duration, 3),
+                ))
+                print(f"[speech] queued transcription for {saved_path}")
+            else:
+                await websocket.send_json({
+                    "type": "ack", "message_type": message_type,
+                    "message": "Message received; this message type is not implemented yet.",
+                })
+    except WebSocketDisconnect:
+        print("[phone] disconnected")
+    except Exception as exc:
+        print(f"[phone] websocket error: {exc!r}")
+        try:
+            await websocket.close(code=1011, reason="Internal bridge error")
+        except Exception:
+            pass
+    finally:
+        AUDIO_STATE["capture_active"] = False
+        async with _state_lock:
+            STATE["connected_clients"] = max(0, STATE["connected_clients"] - 1)
+
+
+if __name__ == "__main__":
+    host = os.getenv("NIGHTSKY_HOST", "0.0.0.0")
+    port = int(os.getenv("NIGHTSKY_PORT", "8765"))
+    import uvicorn
+    uvicorn.run(app, host=host, port=port, log_level="info")

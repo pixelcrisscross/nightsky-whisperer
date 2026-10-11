@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "captures": {
+    "north": {
+      "direction": "north",
+      "known_true_azimuth_deg": 0.0,
+      "measured_true_azimuth_deg": 351.688,
+      "elevation_deg": 4.148,
+      "sample_count": 13,
+      "spread_deg": 0.112,
+      "captured_at_unix": 1791666223.771
+    },
+    "east": {
+      "direction": "east",
+      "known_true_azimuth_deg": 90.0,
+      "measured_true_azimuth_deg": 81.422,
+      "elevation_deg": -0.756,
+      "sample_count": 13,
+      "spread_deg": 0.137,
+      "captured_at_unix": 1791666250.665
+    },
+    "south": {
+      "direction": "south",
+      "known_true_azimuth_deg": 180.0,
+      "measured_true_azimuth_deg": 172.534,
+      "elevation_deg": -2.583,
+      "sample_count": 12,
+      "spread_deg": 0.196,
+      "captured_at_unix": 1791666266.335
+    },
+    "west": {
+      "direction": "west",
+      "known_true_azimuth_deg": 270.0,
+      "measured_true_azimuth_deg": 264.738,
+      "elevation_deg": 1.102,
+      "sample_count": 12,
+      "spread_deg": 0.221,
+      "captured_at_unix": 1791666277.389
+    }
+  }
+}
