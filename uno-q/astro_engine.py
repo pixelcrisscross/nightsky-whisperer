@@ -17,6 +17,15 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+from astropy import units as u
+from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun
+from astropy.time import Time
+from astropy.utils import iers
+
+# Keep coordinate transforms offline; refresh astropy-iers-data explicitly when online.
+iers.conf.auto_download = False
+iers.conf.iers_degraded_accuracy = "warn"
+
 # Coordinates are approximate catalog positions in degrees (RA, Dec).
 # This compact list is for validating the end-to-end pointing pipeline.
 BRIGHT_STARS: list[dict[str, Any]] = [
@@ -66,36 +75,58 @@ def greenwich_mean_sidereal_time_deg(unix_seconds: float) -> float:
 
 def radec_to_altaz(ra_deg: float, dec_deg: float, latitude_deg: float,
                    longitude_deg: float, unix_seconds: float) -> dict[str, float]:
-    """Convert a star's RA/Dec to local geometric altitude/azimuth.
+    """Transform ICRS RA/Dec to topocentric geometric Alt/Az with Astropy.
 
-    Azimuth is measured from true north through east; longitude is positive east.
+    Azimuth is measured from true north through east. Pressure is explicitly
+    zero so atmospheric refraction does not alter the geometric horizon test.
     """
     values = (ra_deg, dec_deg, latitude_deg, longitude_deg, unix_seconds)
     if not all(math.isfinite(float(v)) for v in values):
         raise ValueError("coordinate inputs must be finite numbers")
-    if not -90.0 <= latitude_deg <= 90.0:
+    ra = float(ra_deg)
+    dec = float(dec_deg)
+    lat = float(latitude_deg)
+    lon = float(longitude_deg)
+    timestamp = float(unix_seconds)
+    if not -90.0 <= lat <= 90.0:
         raise ValueError("latitude must be between -90 and 90 degrees")
-    if not -90.0 <= dec_deg <= 90.0:
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError("longitude must be between -180 and 180 degrees")
+    if not -90.0 <= dec <= 90.0:
         raise ValueError("declination must be between -90 and 90 degrees")
 
-    lst_deg = (greenwich_mean_sidereal_time_deg(unix_seconds) + longitude_deg) % 360.0
-    hour_angle_deg = _wrap180(lst_deg - (ra_deg % 360.0))
-    phi = math.radians(latitude_deg)
-    dec = math.radians(dec_deg)
-    hour_angle = math.radians(hour_angle_deg)
-
-    east = -math.cos(dec) * math.sin(hour_angle)
-    north = math.sin(dec) * math.cos(phi) - math.cos(dec) * math.cos(hour_angle) * math.sin(phi)
-    up = math.sin(phi) * math.sin(dec) + math.cos(phi) * math.cos(dec) * math.cos(hour_angle)
-    norm = math.sqrt(east * east + north * north + up * up)
-    east, north, up = east / norm, north / norm, up / norm
-    altitude = math.degrees(math.asin(max(-1.0, min(1.0, up))))
-    azimuth = math.degrees(math.atan2(east, north)) % 360.0
+    obstime = Time(timestamp, format="unix", scale="utc")
+    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+    target = SkyCoord(ra=(ra % 360.0) * u.deg, dec=dec * u.deg, frame="icrs")
+    horizontal = target.transform_to(
+        AltAz(obstime=obstime, location=location, pressure=0 * u.hPa)
+    )
+    local_sidereal_deg = float(obstime.sidereal_time("apparent", longitude=lon * u.deg).deg)
+    hour_angle_deg = _wrap180(local_sidereal_deg - (ra % 360.0))
     return {
-        "azimuth_deg": round(azimuth, 3),
-        "altitude_deg": round(altitude, 3),
-        "hour_angle_deg": round(hour_angle_deg, 3),
+        "azimuth_deg": round(float(horizontal.az.deg) % 360.0, 4),
+        "altitude_deg": round(float(horizontal.alt.deg), 4),
+        "hour_angle_deg": round(hour_angle_deg, 4),
     }
+
+
+def sun_altitude_deg(latitude_deg: float, longitude_deg: float,
+                     unix_seconds: float) -> float:
+    """Return the Sun's geometric altitude in degrees at a location/time."""
+    values = (latitude_deg, longitude_deg, unix_seconds)
+    if not all(math.isfinite(float(v)) for v in values):
+        raise ValueError("location and time must be finite numbers")
+    lat = float(latitude_deg)
+    lon = float(longitude_deg)
+    if not -90.0 <= lat <= 90.0:
+        raise ValueError("latitude must be between -90 and 90 degrees")
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError("longitude must be between -180 and 180 degrees")
+    obstime = Time(float(unix_seconds), format="unix", scale="utc")
+    location = EarthLocation(lat=lat * u.deg, lon=lon * u.deg)
+    frame = AltAz(obstime=obstime, location=location, pressure=0 * u.hPa)
+    sun = get_sun(obstime).transform_to(frame)
+    return round(float(sun.alt.deg), 4)
 
 
 def _horizontal_vector(azimuth_deg: float, altitude_deg: float) -> tuple[float, float, float]:

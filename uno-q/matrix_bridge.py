@@ -75,7 +75,7 @@ class RouterRPCClient:
 MATRIX_DIRECTIONS = {
     "idle", "up", "down", "left", "right", "hold",
     "turn_around", "target_acquired", "target_below_horizon",
-    "listening", "thinking", "speaking", "error",
+    "listening", "thinking", "speaking", "easter_egg", "error",
 }
 
 

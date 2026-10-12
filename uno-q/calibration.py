@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,9 @@ class HeadingCalibration:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self.captures: dict[str, dict[str, Any]] = {}
+        # Guards captures dict and the on-disk write. RLock so that
+        # add_capture can hold it across a nested status() call.
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -55,6 +59,7 @@ class HeadingCalibration:
             self.captures = {}
 
     def _save(self) -> None:
+        # Caller must hold self._lock.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "captures": self.captures}
         temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -62,11 +67,12 @@ class HeadingCalibration:
         os.replace(temp_path, self.path)
 
     def reset(self) -> None:
-        self.captures = {}
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError:
-            self._save()
+        with self._lock:
+            self.captures = {}
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                self._save()
 
     def add_capture(
         self,
@@ -89,19 +95,25 @@ class HeadingCalibration:
         if float(spread_deg) > 8.0:
             raise ValueError("heading is moving or unstable; hold the phone still and capture again")
 
-        self.captures[label] = {
-            "direction": label,
-            "known_true_azimuth_deg": CARDINAL_AZIMUTHS[label],
-            "measured_true_azimuth_deg": round(float(measured_true_azimuth_deg) % 360.0, 3),
-            "elevation_deg": round(float(elevation_deg), 3),
-            "sample_count": int(sample_count),
-            "spread_deg": round(float(spread_deg), 3),
-            "captured_at_unix": round(time.time(), 3),
-        }
-        self._save()
-        return self.status()
+        with self._lock:
+            self.captures[label] = {
+                "direction": label,
+                "known_true_azimuth_deg": CARDINAL_AZIMUTHS[label],
+                "measured_true_azimuth_deg": round(float(measured_true_azimuth_deg) % 360.0, 3),
+                "elevation_deg": round(float(elevation_deg), 3),
+                "sample_count": int(sample_count),
+                "spread_deg": round(float(spread_deg), 3),
+                "captured_at_unix": round(time.time(), 3),
+            }
+            self._save()
+            return self._status_locked()
 
     def status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> dict[str, Any]:
+        # Caller must hold self._lock.
         labels = [label for label in CARDINAL_AZIMUTHS if label in self.captures]
         missing = [label for label in CARDINAL_AZIMUTHS if label not in self.captures]
         offsets = [

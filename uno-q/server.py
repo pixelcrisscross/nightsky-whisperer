@@ -1,4 +1,4 @@
-"""NightSky Whisperer phone bridge, astronomy, guidance, and LED matrix API (v0.6.0)."""
+"""NightSky Whisperer phone bridge, astronomy, guidance, and LED matrix API (v0.6.1)."""
 from __future__ import annotations
 
 import asyncio
@@ -6,8 +6,8 @@ import json
 import os
 import re
 import subprocess
-import threading
 import tempfile
+import threading
 import time
 import wave
 import urllib.error
@@ -20,12 +20,16 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from audio_transport import (
-    CHANNELS as AUDIO_CHANNELS, MAX_AUDIO_BYTES, MAX_AUDIO_SECONDS, SAMPLE_RATE_HZ as AUDIO_SAMPLE_RATE_HZ,
+    CHANNELS as AUDIO_CHANNELS, MAX_AUDIO_BYTES, MAX_AUDIO_SECONDS,
+    SAMPLE_RATE_HZ as AUDIO_SAMPLE_RATE_HZ,
     iter_pcm_chunks, normalize_pcm16, write_pcm_wav,
 )
 from pydantic import BaseModel
 
-from astro_engine import BRIGHT_STARS, nearest_bright_stars, radec_to_altaz, visible_bright_stars
+from astro_engine import (
+    BRIGHT_STARS, nearest_bright_stars, radec_to_altaz,
+    sun_altitude_deg, visible_bright_stars,
+)
 from calibration import HeadingCalibration, circular_mean_deg, wrap180
 from sky_engine import compute_pointing
 from target_guidance import calculate_guidance
@@ -70,7 +74,7 @@ class MatrixFollowRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    print("NightSky Whisperer phone bridge starting (v0.6.0)")
+    print("NightSky Whisperer phone bridge starting (v0.6.1)")
     print(f"Heading calibration file: {CALIBRATION_PATH}")
     worker = asyncio.create_task(_matrix_auto_follow_worker())
     try:
@@ -90,7 +94,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="NightSky Whisperer Phone Bridge",
-    version="0.6.0",
+    version="0.6.1",
     lifespan=lifespan,
 )
 
@@ -102,8 +106,14 @@ MATRIX_STATE: dict[str, Any] = {
     "last_result": None,
     "last_error": None,
     "commands_sent": 0,
+    "activity_mode": "idle",
+    "activity_generation": 0,
+    "navigation_active": False,
+    "navigation_direction": None,
+    "special_animation_until": 0.0,
 }
 MATRIX_STATE_LOCK = asyncio.Lock()
+MATRIX_COMMAND_LOCK = asyncio.Lock()
 MATRIX_AUTO_FOLLOW_INTERVAL_SECONDS = 0.25
 AUDIO_DIR = Path(os.getenv("NIGHTSKY_AUDIO_DIR", str(Path.home() / "nightsky-whisperer" / "audio")))
 AUDIO_LATEST_WAV = AUDIO_DIR / "latest_mic.wav"
@@ -121,7 +131,7 @@ LLAMA_BIN = Path(os.getenv(
 ))
 GEMMA_MODEL = Path(os.getenv(
     "NIGHTSKY_GEMMA_MODEL",
-    str(Path.home() / "nightsky-whisperer" / "models" / "gemma-3-1b-it-Q4_K_M.gguf"),
+    str(Path.home() / "nightsky-whisperer" / "models" / "google_gemma-3-270m-it-Q4_K_M.gguf"),
 ))
 PIPER_BIN = Path(os.getenv(
     "NIGHTSKY_PIPER_BIN",
@@ -152,6 +162,8 @@ def _get_piper_voice():
             _PIPER_VOICE = PiperVoice.load(str(PIPER_MODEL))
             print("[speech] Piper voice loaded")
     return _PIPER_VOICE
+
+
 AUDIO_STATE: dict[str, Any] = {
     "capture_active": False,
     "last_recording_path": None,
@@ -163,7 +175,17 @@ AUDIO_STATE: dict[str, Any] = {
     "last_transcription_error": None,
     "last_assistant_response": None,
     "last_assistant_error": None,
+    "last_speech_error": None,
+    "last_speech_duration_seconds": None,
 }
+
+# ── Voice pipeline serialization ────────────────────────────────────────────
+# Whisper, Gemma, and Piper all run on the same ARM cores. Letting a second
+# recording start while the first is still synthesizing is what produced the
+# 13.6 s Whisper and 21.98 s Gemma outliers in the progress notes.
+VOICE_PIPELINE_LOCK = asyncio.Lock()
+VOICE_PIPELINE_QUEUED = 0
+VOICE_PIPELINE_MAX_QUEUE = 1
 
 
 def _run_whisper_cli(audio_path: Path) -> dict[str, Any]:
@@ -183,18 +205,6 @@ def _run_whisper_cli(audio_path: Path) -> dict[str, Any]:
                 "--no-prints",
                 "-t", "4",
                 "-l", "en",
-                "--prompt", os.getenv(
-                    "NIGHTSKY_WHISPER_PROMPT",
-                    (
-                        "NightSky Whisperer, an astronomy voice assistant. "
-                        "Star names: Betelgeuse, Sirius, Vega, Arcturus, "
-                        "Rigel, Procyon, Hadar, Spica, Antares, Pollux, "
-                        "Regulus, Castor, Dubhe, Polaris, Mizar, Altair, "
-                        "Aldebaran, Deneb, Capella, Canopus. "
-                        "Commands: find, locate, show me, point me to, "
-                        "what is, tell me about."
-                    ),
-                ),
             ],
             capture_output=True,
             text=True,
@@ -281,6 +291,7 @@ def _run_gemma_cli(user_text: str) -> dict[str, Any]:
 
     return {"ok": True, "text": answer}
 
+
 def _run_piper_cli(text: str) -> dict[str, Any]:
     """Synthesize speech with the cached Alba voice."""
     if not text.strip():
@@ -293,9 +304,7 @@ def _run_piper_cli(text: str) -> dict[str, Any]:
     try:
         voice = _get_piper_voice()
 
-        fd, output_path = tempfile.mkstemp(
-            prefix="nightsky-tts-", suffix=".wav"
-        )
+        fd, output_path = tempfile.mkstemp(prefix="nightsky-tts-", suffix=".wav")
         os.close(fd)
 
         # Serialize inference against the shared voice object.
@@ -328,18 +337,13 @@ def _run_piper_cli(text: str) -> dict[str, Any]:
             except OSError:
                 pass
 
+
 def _normalize_astronomy_transcript(text: str) -> str:
-    """Correct observed wake-phrase and Betelgeuse transcription errors."""
+    """Correct known recognition errors for common star names."""
     result = re.sub(
-        r"\b(?:"
-        r"beetle[\s-]*juice|"
-        r"betel[\s-]*juice|"
-        r"better[\s-]*juice|"
-        r"b\s*2[\s-]*juice|"
-        r"me\s+to\s+juice|"
-        r"we\s+till\s+juice|"
-        r"betelgeuse"
-        r")\b",
+        r"\b(?:beetle[\s-]*juice|betel[\s-]*juice|better[\s-]*juice|"
+        r"b\s*2[\s-]*juice|me\s+to\s+juice|we\s+till\s+juice|"
+        r"betelgeuse)\b",
         "Betelgeuse",
         text,
         flags=re.IGNORECASE,
@@ -347,88 +351,173 @@ def _normalize_astronomy_transcript(text: str) -> str:
 
     result = re.sub(
         r"^\s*(hi|hey|hello)[, ]+"
-        r"(?:nice guy|nice sky|night sky|night-sky|night skye|night sky whisperer)\b",
+        r"(?:nice guy|nice sky|night sky|night-sky|night skye)\b",
         r"\1 NightSky",
         result,
         count=1,
         flags=re.IGNORECASE,
     )
-
-    # Whisper occasionally hears "fine" where the speaker said "find".
-    # Correct it only when a known target name follows shortly afterward.
-    result = re.sub(
-        r"\b(?:fine|find)\b(?=[^\n]{0,35}\bBetelgeuse\b)",
-        "find",
-        result,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-
     return result.strip()
 
+
 def _known_astronomy_answer(text: str) -> str | None:
-    """Answer a narrowly recognized basic star question deterministically."""
-    lower = text.lower()
+    """Answer simple catalogue questions deterministically where possible."""
+    lower = text.casefold()
 
-    asks_for_explanation = re.search(
-        r"\b(?:what is|what's|tell me about|describe|explain)\b",
+    # Only intercept basic factual questions, not stories or navigation requests.
+    if not re.search(
+        r"\b(?:what is|what's|tell me about|describe|explain|"
+        r"which constellation|what constellation|how far away)\b",
         lower,
-    )
-    asks_to_find = re.search(
-        r"\b(?:find|locate|point(?: me)? to|show me|navigate to)\b",
-        lower,
-    )
+    ):
+        return None
 
-    if "betelgeuse" in lower and asks_for_explanation and not asks_to_find:
-        return (
-            "Betelgeuse is a red supergiant star in Orion, "
-            "known for its reddish colour near the hunter's shoulder."
-        )
+    if re.search(r"\b(?:find|locate|navigate to|point me to)\b", lower):
+        return None
+
+    for star in BRIGHT_STARS:
+        name = str(star["name"])
+        if not re.search(
+            r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)",
+            lower,
+        ):
+            continue
+
+        if re.search(r"\bhow far away\b", lower):
+            return (
+                f"I don't have a verified distance for {name} "
+                "in my current offline star catalogue."
+            )
+
+        if name.casefold() == "betelgeuse":
+            return (
+                "Betelgeuse is a red supergiant star in Orion, "
+                "known for its reddish colour near the hunter's shoulder."
+            )
+
+        if name.casefold() == "arcturus":
+            return (
+                "Arcturus is a bright red giant star in Boötes, "
+                "with an apparent magnitude of minus 0.05."
+            )
+
+        constellation = star.get("constellation")
+        magnitude = star.get("magnitude")
+        if constellation and magnitude is not None:
+            try:
+                return (
+                    f"{name} is a star in {constellation}, "
+                    f"with an apparent magnitude of {float(magnitude):.2f}."
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if constellation:
+            return f"{name} is a star in the constellation {constellation}."
 
     return None
 
 
-def _parse_target_command(text: str) -> dict[str, Any] | None:
-    """Recognize explicit target requests against the curated star catalogue."""
-    command = re.search(
-        r"\b(?:find|locate|show\s+me|look\s+for|search\s+for|"
-        r"navigate\s+to|point(?:\s+me)?\s+(?:to|at))\b",
+def _extract_navigation_target(text: str) -> str | None:
+    """Resolve an explicit voice navigation command to a curated star ID."""
+    intent = re.search(
+        r"\b(?:find|locate|track|follow)\b|"
+        r"\b(?:navigate|guide|direct|point|aim)\b|"
+        r"\bshow\s+me\s+(?:the\s+way|where)\b",
         text,
         flags=re.IGNORECASE,
     )
-    if not command:
+    if not intent:
         return None
 
-    requested = text[command.end():].strip(" \t.,!?;:")
-    requested = re.sub(
-        r"\b(?:please|now|tonight|right\s+now|for\s+me)\b",
-        "",
-        requested,
-        flags=re.IGNORECASE,
-    ).strip(" \t.,!?;:")
-
-    if not requested:
-        return {"type": "find_target", "target": ""}
-
-    # Prefer exact catalogue names and longer names first.
-    for star in sorted(
-        BRIGHT_STARS,
-        key=lambda item: len(str(item["name"])),
-        reverse=True,
-    ):
+    normalized = text.casefold()
+    for star in sorted(BRIGHT_STARS, key=lambda row: len(str(row["name"])), reverse=True):
         name = str(star["name"])
-        if re.search(
-            r"(?<!\w)" + re.escape(name) + r"(?!\w)",
-            requested,
-            flags=re.IGNORECASE,
-        ):
-            return {"type": "find_target", "target": name}
+        if re.search(r"(?<!\w)" + re.escape(name.casefold()) + r"(?!\w)", normalized):
+            return str(star["id"])
+    return None
 
-    return {"type": "find_target", "target": requested[:80]}
+
+async def _activate_voice_navigation(target_id: str) -> dict[str, Any]:
+    """Select a voice-requested star and immediately apply safe matrix guidance."""
+    target = next((row for row in BRIGHT_STARS if str(row["id"]) == target_id), None)
+    if target is None:
+        return {"response": "I couldn't match that name to a star in my current catalogue."}
+
+    async with _state_lock:
+        STATE["selected_target_id"] = target["id"]
+        STATE["target_selected_at_unix"] = time.time()
+
+    # Turn on the navigation session, but start in a safe non-directional state.
+    async with MATRIX_STATE_LOCK:
+        MATRIX_STATE["auto_follow_enabled"] = True
+        MATRIX_STATE["navigation_active"] = False
+        MATRIX_STATE["navigation_direction"] = "error"
+        MATRIX_STATE["manual_direction"] = None
+        MATRIX_STATE["manual_direction_until"] = 0.0
+
+    guidance = await target_guidance()
+    response: str
+    nav_active = False
+    nav_direction = "error"
+
+    if not guidance.get("available"):
+        error = str(guidance.get("error", "guidance_unavailable"))
+        response = (
+            f"I've selected {target['name']}, but I can't start directional guidance yet: "
+            "the phone's live position data is unavailable or stale. Reconnect the phone and try again."
+        )
+    elif (
+        guidance.get("direction") == "target_below_horizon"
+        or guidance.get("visibility_status") == "below_horizon"
+        or guidance.get("geometrically_above_horizon") is False
+    ):
+        nav_direction = "target_below_horizon"
+        response = (
+            f"I've selected {target['name']}, but it is below the geometric horizon. "
+            "Directional arrows are paused; I'll keep checking its position."
+        )
+    elif not bool(guidance.get("navigation_actionable", True)):
+        nav_direction = "error"
+        sun_alt = guidance.get("solar_altitude_deg")
+        if isinstance(sun_alt, (int, float)) and sun_alt > -12.0:
+            response = (
+                f"I've selected {target['name']}, but the Sun is too high for reliable "
+                "star navigation. Directional arrows are paused until darker conditions."
+            )
+        else:
+            response = (
+                f"I've selected {target['name']}, but safe directional guidance is unavailable. "
+                "I'll keep the navigation session paused."
+            )
+    else:
+        nav_direction = str(guidance.get("direction", "error"))
+        if nav_direction not in MATRIX_DIRECTIONS:
+            nav_direction = "error"
+        nav_active = nav_direction not in {"error", "target_below_horizon"}
+        if nav_active:
+            response = f"{target['name']} selected. Follow the arrows on the NightSky Whisperer matrix."
+        else:
+            response = (
+                f"I've selected {target['name']}, but guidance is currently paused for safety."
+            )
+
+    async with MATRIX_STATE_LOCK:
+        MATRIX_STATE["auto_follow_enabled"] = True
+        MATRIX_STATE["navigation_active"] = nav_active
+        MATRIX_STATE["navigation_direction"] = nav_direction
+
+    matrix_result = await _matrix_render_effective(force=True)
+    return {
+        "response": response,
+        "target": target["id"],
+        "guidance": guidance,
+        "matrix_result": matrix_result,
+    }
 
 
 def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
-    """Transcribe, correct known astronomy terms, answer, then synthesize."""
+    """Transcribe audio, use local star facts where possible, and synthesize speech."""
     pipeline_started = time.perf_counter()
 
     stage_started = time.perf_counter()
@@ -436,7 +525,6 @@ def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
     print(f"[timing] whisper={time.perf_counter() - stage_started:.2f}s")
 
     if not transcription.get("ok"):
-        print(f"[timing] pipeline_total={time.perf_counter() - pipeline_started:.2f}s")
         return transcription
 
     raw_text = str(transcription.get("text", "")).strip()
@@ -445,59 +533,65 @@ def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
     if recognized_text != raw_text:
         print(f"[speech] normalized transcript: {recognized_text!r}")
 
-    # Handle explicit target-selection commands deterministically.
-    intent = _parse_target_command(recognized_text)
-    if intent is not None:
-        print(f"[speech] navigation intent: {intent}")
-        print(
-            f"[timing] pipeline_total="
-            f"{time.perf_counter() - pipeline_started:.2f}s"
-        )
-        return {
-            "ok": True,
-            "raw_text": raw_text,
-            "text": recognized_text,
-            "intent": intent,
-            "response": "",
-            "response_ok": True,
-        }
+    response_error = None
+    matrix_command = None
+    navigation_target = _extract_navigation_target(recognized_text)
 
-    if not recognized_text:
+    if navigation_target:
+        selected_star = next(
+            row for row in BRIGHT_STARS if str(row["id"]) == navigation_target
+        )
+        response_text = (
+            f"Checking {selected_star['name']}'s current position and navigation safety."
+        )
+        response_ok = True
+    elif not recognized_text:
         response_text = "Sorry, I couldn't make out what you said. Please try again."
         response_ok = True
-        response_error = None
+    elif re.search(
+        r"\b(?:cosmic\s+cascade|open\s+sesame|"
+        r"activate\s+(?:the\s+)?easter\s+egg|"
+        r"show\s+(?:me\s+)?a\s+shooting\s+star|secret\s+starfield)\b",
+        recognized_text,
+        flags=re.IGNORECASE,
+    ):
+        # The display animation is triggered after the acknowledgement finishes.
+        matrix_command = "easter_egg"
+        response_text = (
+            "You've unlocked the cosmic cascade. Watch the matrix for a secret starfield."
+        )
+        response_ok = True
     else:
-        # Prefer a trusted local response for this known basic astronomy query.
         response_text = _known_astronomy_answer(recognized_text)
 
         if response_text is not None:
             response_ok = True
-            response_error = None
-            print("[assistant] using deterministic astronomy answer")
+            print("[assistant] using local catalogue answer")
         else:
             stage_started = time.perf_counter()
             generated = _run_gemma_cli(recognized_text)
             print(f"[timing] gemma={time.perf_counter() - stage_started:.2f}s")
 
-            if generated.get("ok"):
-                response_text = str(generated.get("text", "")).strip()
-                response_ok = bool(response_text)
-                response_error = None
-                if not response_text:
-                    response_text = "Sorry, I couldn't generate a response."
+            if generated.get("ok") and str(generated.get("text", "")).strip():
+                response_text = str(generated["text"]).strip()
+                response_ok = True
             else:
                 response_text = (
                     "I recognized your words, but couldn't generate a reply "
                     "with my local language model."
                 )
                 response_ok = False
-                response_error = str(
-                    generated.get("error", "Unknown Gemma error")
-                )
+                response_error = str(generated.get("error", "Empty response"))
 
-    stage_started = time.perf_counter()
-    speech = _run_piper_cli(response_text)
-    print(f"[timing] piper={time.perf_counter() - stage_started:.2f}s")
+    if navigation_target:
+        # Target safety is computed asynchronously in the WebSocket event loop;
+        # synthesize the final, truthful acknowledgement only after that check.
+        speech = {"ok": False, "error": "deferred_until_navigation_state_is_known"}
+        print("[speech] navigation intent: deferring TTS until guidance is checked")
+    else:
+        stage_started = time.perf_counter()
+        speech = _run_piper_cli(response_text)
+        print(f"[timing] piper={time.perf_counter() - stage_started:.2f}s")
 
     outcome = {
         "ok": True,
@@ -506,6 +600,8 @@ def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
         "response": response_text,
         "response_ok": response_ok,
         "response_error": response_error,
+        "matrix_command": matrix_command,
+        "navigation_target": navigation_target,
         "speech_ok": bool(speech.get("ok")),
         "speech_sample_rate_hz": speech.get("sample_rate_hz"),
         "speech_duration_seconds": speech.get("duration_seconds"),
@@ -518,7 +614,6 @@ def _run_voice_pipeline(audio_path: Path) -> dict[str, Any]:
     print(f"[speech] transcription: {recognized_text!r}")
     print(f"[assistant] response: {response_text!r}")
     print(f"[timing] pipeline_total={time.perf_counter() - pipeline_started:.2f}s")
-
     return outcome
 
 
@@ -526,6 +621,24 @@ async def _transcribe_wav_async(audio_path: Path) -> dict[str, Any]:
     """Keep speech and language-model inference off the WebSocket event loop."""
     return await asyncio.to_thread(_run_voice_pipeline, audio_path)
 
+
+async def _serialized_voice_pipeline(audio_path: Path) -> dict[str, Any]:
+    """Run the full Whisper→Gemma→Piper chain under a single-job lock.
+
+    Rejects are handled by the caller via VOICE_PIPELINE_QUEUED before the
+    task is created, so this wrapper only needs to hold the lock and unwind
+    the queue counter in all exit paths.
+    """
+    global VOICE_PIPELINE_QUEUED
+    try:
+        async with VOICE_PIPELINE_LOCK:
+            started = time.perf_counter()
+            outcome = await asyncio.to_thread(_run_voice_pipeline, audio_path)
+            elapsed = time.perf_counter() - started
+            print(f"[speech] pipeline for {audio_path.name} finished in {elapsed:.2f}s")
+            return outcome
+    finally:
+        VOICE_PIPELINE_QUEUED = max(0, VOICE_PIPELINE_QUEUED - 1)
 
 
 def _apply_heading_calibration(pointing: dict[str, Any], offset: float | None) -> dict[str, Any]:
@@ -555,7 +668,7 @@ async def _current_observer_state() -> tuple[dict[str, Any] | None, float | None
 async def root() -> dict[str, Any]:
     return {
         "name": "NightSky Whisperer Phone Bridge",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "health": "/health",
         "latest_telemetry": "/latest",
         "pointing": "/pointing",
@@ -577,11 +690,12 @@ async def health() -> JSONResponse:
         result = {
             "ok": True,
             "service": "nightsky-phone-bridge",
-            "version": "0.6.0",
+            "version": "0.6.1",
             "connected_clients": STATE["connected_clients"],
             "telemetry_count": STATE["telemetry_count"],
             "telemetry_age_seconds": round(time.time() - latest_at, 2) if latest_at else None,
             "uptime_seconds": round(time.time() - STATE["started_at"], 2),
+            "voice_pipeline_queue": VOICE_PIPELINE_QUEUED,
         }
     return JSONResponse(result)
 
@@ -904,10 +1018,14 @@ async def target_guidance(acquisition_radius_deg: float = 2.0) -> dict[str, Any]
                     "message": "Android magnetic declination is unavailable; do not guide using an unverified north reference."}
         current_az = (float(raw_azimuth) + heading_offset) % 360.0
         current_alt = float(axis["elevation_deg"])
-        timestamp = float(telemetry.get("ts_unix_ms", 0)) / 1000.0
-        if timestamp <= 0:
-            timestamp = float(received_at)
+        telemetry_timestamp = float(telemetry.get("ts_unix_ms", 0)) / 1000.0
+        if telemetry_timestamp <= 0:
+            telemetry_timestamp = float(received_at)
+        # Star positions advance with current server UTC; phone telemetry is
+        # used for location/orientation only and is independently freshness-checked.
+        timestamp = time.time()
         target_horizontal = radec_to_altaz(target["ra_deg"], target["dec_deg"], latitude, longitude, timestamp)
+        solar_altitude = sun_altitude_deg(latitude, longitude, timestamp)
         result = calculate_guidance(
             current_azimuth_deg=current_az,
             current_altitude_deg=current_alt,
@@ -924,15 +1042,41 @@ async def target_guidance(acquisition_radius_deg: float = 2.0) -> dict[str, Any]
             "observer": {"latitude_deg": latitude, "longitude_deg": longitude,
                          "location_accuracy_m": location.get("accuracy_m")},
             "timestamp_unix": timestamp,
+            "telemetry_timestamp_unix": telemetry_timestamp,
+            "telemetry_clock_skew_seconds": round(timestamp - telemetry_timestamp, 3),
+            "solar_altitude_deg": solar_altitude,
+            "geometrically_above_horizon": target_horizontal["altitude_deg"] >= 0.0,
+            "navigation_actionable": False,
+            "visibility_status": "pending",
             "telemetry_age_seconds": round(age, 3),
-            "guidance_frame": "coarse dominant-axis azimuth/elevation hint; matrix symbols are implemented, but physical phone+board movement mapping still needs validation",
+            "guidance_frame": "Astropy ICRS-to-topocentric geometric AltAz; matrix symbols are implemented, but physical phone+board movement mapping still needs validation",
             "safety_note": "Geometric star direction only. This does not confirm that a star is visually visible through clouds, daylight, glare, or obstructions.",
         })
-        if target_horizontal["altitude_deg"] < 0.0:
+        target_altitude = float(target_horizontal["altitude_deg"])
+        if target_altitude < 0.0:
+            result["navigation_actionable"] = False
+            result["visibility_status"] = "below_horizon"
             result["direction"] = "target_below_horizon"
             result["arrow"] = "—"
             result["acquired"] = False
-            result["message"] = "This star is geometrically below the horizon at the current location/time."
+            result["message"] = "This star is geometrically below the horizon at the current location/time. Directional navigation is disabled."
+        elif target_altitude < 1.0:
+            result["navigation_actionable"] = False
+            result["visibility_status"] = "too_close_to_horizon"
+            result["direction"] = "error"
+            result["arrow"] = "—"
+            result["acquired"] = False
+            result["message"] = "Star guidance paused: the target is within 1 degree of the geometric horizon."
+        elif solar_altitude > -12.0:
+            result["navigation_actionable"] = False
+            result["visibility_status"] = "sky_too_bright"
+            result["direction"] = "error"
+            result["arrow"] = "—"
+            result["acquired"] = False
+            result["message"] = "Star guidance paused: the Sun is above the -12 degree nautical-twilight threshold, so naked-eye star visibility is not reliable."
+        else:
+            result["navigation_actionable"] = True
+            result["visibility_status"] = "dark_sky_target_above_horizon"
         return result
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         return {"available": False, "error": f"Cannot calculate target guidance: {exc}"}
@@ -962,6 +1106,133 @@ async def _send_matrix_direction(direction: str) -> dict[str, Any]:
         }
 
 
+MATRIX_ACTIVITY_MODES = {"idle", "listening", "thinking", "speaking"}
+
+
+async def _matrix_render_effective(force: bool = False) -> dict[str, Any]:
+    """Render the highest-priority state without flooding MCU RPC."""
+    async with MATRIX_COMMAND_LOCK:
+        async with MATRIX_STATE_LOCK:
+            now = time.time()
+            nav_active = bool(MATRIX_STATE["navigation_active"])
+            nav_direction = MATRIX_STATE["navigation_direction"]
+            activity = MATRIX_STATE["activity_mode"]
+            last = MATRIX_STATE["last_command"]
+            special_until = float(MATRIX_STATE["special_animation_until"])
+
+            manual_direction = MATRIX_STATE.get("manual_direction")
+            manual_until = float(
+                MATRIX_STATE.get("manual_direction_until", 0.0)
+            )
+            manual_active = (
+                manual_direction in MATRIX_DIRECTIONS
+                and now < manual_until
+            )
+
+            if nav_direction in {"target_below_horizon", "error"}:
+                desired = nav_direction
+            elif nav_active and nav_direction in MATRIX_DIRECTIONS:
+                desired = nav_direction
+            elif manual_active:
+                desired = str(manual_direction)
+            else:
+                desired = activity if activity in MATRIX_ACTIVITY_MODES else "idle"
+
+            # Let firmware-owned temporary animations finish. A new valid
+            # navigation direction always takes precedence over an Easter egg.
+            if last == "target_acquired" and now < special_until:
+                return {
+                    "available": True, "sent": False,
+                    "direction": last, "temporary_animation": True,
+                }
+            if (
+                not nav_active
+                and desired == "idle"
+                and last == "easter_egg"
+                and now < special_until
+            ):
+                return {
+                    "available": True, "sent": False,
+                    "direction": last, "temporary_animation": True,
+                }
+
+            if not force and desired == last:
+                return {
+                    "available": True, "sent": True,
+                    "unchanged": True, "direction": desired,
+                }
+
+        return await _send_matrix_direction(desired)
+
+
+async def _matrix_set_activity(
+    mode: str, expected_generation: int | None = None
+) -> dict[str, Any]:
+    """Update voice activity; valid navigation remains the display priority."""
+    if mode not in MATRIX_ACTIVITY_MODES:
+        raise ValueError(f"Invalid matrix activity mode: {mode!r}")
+
+    async with MATRIX_STATE_LOCK:
+        generation = int(MATRIX_STATE["activity_generation"])
+        if expected_generation is not None:
+            if (
+                generation != expected_generation
+                or MATRIX_STATE["activity_mode"] != "speaking"
+            ):
+                return {
+                    "available": True, "sent": False, "stale": True,
+                    "activity_generation": generation,
+                }
+
+        MATRIX_STATE["activity_mode"] = mode
+        MATRIX_STATE["activity_generation"] = generation + 1
+        next_generation = generation + 1
+
+    result = await _matrix_render_effective()
+    result["activity_generation"] = next_generation
+    return result
+
+
+async def _matrix_trigger_easter_egg() -> dict[str, Any]:
+    """Show the secret cosmic cascade only when navigation is inactive."""
+    async with MATRIX_COMMAND_LOCK:
+        async with MATRIX_STATE_LOCK:
+            if MATRIX_STATE["navigation_active"]:
+                return {
+                    "available": True, "sent": False,
+                    "suppressed": "navigation_has_priority",
+                }
+
+            MATRIX_STATE["activity_mode"] = "idle"
+            MATRIX_STATE["activity_generation"] += 1
+            MATRIX_STATE["special_animation_until"] = time.time() + 3.9
+            last = MATRIX_STATE["last_command"]
+
+        # Ensure the animation's remembered return state is idle.
+        if last != "idle":
+            await _send_matrix_direction("idle")
+        return await _send_matrix_direction("easter_egg")
+
+
+async def _matrix_finish_speaking_after(
+    duration_seconds: float,
+    expected_generation: int,
+    trigger_easter_egg: bool = False,
+) -> None:
+    """End speaking after the expected playback duration without blocking WS."""
+    await asyncio.sleep(max(0.25, min(float(duration_seconds), 120.0)))
+    result = await _matrix_set_activity(
+        "idle", expected_generation=expected_generation
+    )
+    if result.get("stale"):
+        return
+
+    if trigger_easter_egg:
+        egg = await _matrix_trigger_easter_egg()
+        if egg.get("suppressed"):
+            print("[matrix] Easter egg suppressed: navigation has priority")
+
+
 @app.get("/matrix/status")
 async def matrix_status() -> dict[str, Any]:
     async with MATRIX_STATE_LOCK:
@@ -983,6 +1254,28 @@ async def matrix_show(request: MatrixShowRequest) -> dict[str, Any]:
         direction = validate_direction(request.direction)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if direction in {"target_below_horizon", "error"}:
+        async with MATRIX_COMMAND_LOCK:
+            async with MATRIX_STATE_LOCK:
+                MATRIX_STATE["manual_direction"] = direction
+                MATRIX_STATE["manual_direction_until"] = time.time() + 5.0
+                MATRIX_STATE["navigation_active"] = False
+            return await _send_matrix_direction(direction)
+
+    async with MATRIX_STATE_LOCK:
+        MATRIX_STATE["manual_direction"] = None
+        MATRIX_STATE["manual_direction_until"] = 0.0
+
+    if direction == "easter_egg":
+        return await _matrix_trigger_easter_egg()
+
+    if direction == "target_acquired":
+        async with MATRIX_COMMAND_LOCK:
+            async with MATRIX_STATE_LOCK:
+                MATRIX_STATE["special_animation_until"] = time.time() + 2.25
+            return await _send_matrix_direction(direction)
+
     return await _send_matrix_direction(direction)
 
 
@@ -990,57 +1283,95 @@ async def matrix_show(request: MatrixShowRequest) -> dict[str, Any]:
 async def matrix_auto_follow(request: MatrixFollowRequest) -> dict[str, Any]:
     async with MATRIX_STATE_LOCK:
         MATRIX_STATE["auto_follow_enabled"] = bool(request.enabled)
+        if not request.enabled:
+            MATRIX_STATE["navigation_active"] = False
+            MATRIX_STATE["navigation_direction"] = None
+
     if not request.enabled:
-        idle_result = await _send_matrix_direction("idle")
-        return {"available": True, "auto_follow_enabled": False, "matrix_idle_result": idle_result}
+        result = await _matrix_render_effective(force=True)
+        return {
+            "available": True,
+            "auto_follow_enabled": False,
+            "matrix_result": result,
+        }
+
     return {
         "available": True,
         "auto_follow_enabled": True,
-        "message": "The server will send a new matrix command when the live guidance direction changes.",
+        "message": "Navigation guidance will take display priority over voice animations.",
     }
 
 
 async def _matrix_auto_follow_worker() -> None:
-    """Optionally mirror named-target guidance to the physical matrix.
-
-    Sending is opt-in; no MCU requests are made until /matrix/auto-follow is enabled.
-    Repeated directions are deduplicated so high-rate sensor telemetry does not flood RPC.
-    """
-    last_direction: str | None = None
+    """Refresh navigation state and render only when the effective mode changes."""
     last_attempt_at = 0.0
+
     while True:
         await asyncio.sleep(MATRIX_AUTO_FOLLOW_INTERVAL_SECONDS)
+
         async with MATRIX_STATE_LOCK:
             enabled = bool(MATRIX_STATE["auto_follow_enabled"])
-            last_error = MATRIX_STATE["last_error"]
+
+        guidance: dict[str, Any] = {}
+        if enabled:
+            guidance = await target_guidance()
+
+        guidance_available = bool(enabled and guidance.get("available"))
         if not enabled:
-            last_direction = None
-            continue
-
-        guidance = await target_guidance()
-        if guidance.get("available"):
-            direction = guidance.get("direction", "idle")
-        else:
-            # A selected target with stale/invalid data should not leave an old
-            # directional command on screen. No-target defaults safely to idle.
-            direction = "idle"
-
-        if direction not in MATRIX_DIRECTIONS:
+            nav_active = False
+            direction = None
+        elif not guidance_available:
+            nav_active = False
             direction = "error"
-        if direction == last_direction:
+        elif guidance.get("direction") == "target_below_horizon":
+            nav_active = False
+            direction = "target_below_horizon"
+        elif not guidance.get("navigation_actionable", True):
+            nav_active = False
+            direction = guidance.get("direction", "error")
+        else:
+            nav_active = True
+            direction = guidance.get("direction", "idle")
+        if direction is not None and direction not in MATRIX_DIRECTIONS:
+            direction = "error"
+
+        async with MATRIX_STATE_LOCK:
+            MATRIX_STATE["navigation_active"] = nav_active
+            MATRIX_STATE["navigation_direction"] = direction
+
+            manual_direction = MATRIX_STATE.get("manual_direction")
+            manual_until = float(
+                MATRIX_STATE.get("manual_direction_until", 0.0)
+            )
+            manual_active = (
+                manual_direction in MATRIX_DIRECTIONS
+                and time.time() < manual_until
+            )
+
+            if direction in {"target_below_horizon", "error"}:
+                desired = direction
+            elif nav_active and direction in MATRIX_DIRECTIONS:
+                desired = direction
+            elif manual_active:
+                desired = str(manual_direction)
+            else:
+                activity = MATRIX_STATE["activity_mode"]
+                desired = activity if activity in MATRIX_ACTIVITY_MODES else "idle"
+
+            last = MATRIX_STATE["last_command"]
+            last_error = MATRIX_STATE["last_error"]
+
+        if desired == last:
             continue
-        # If the MCU bridge is unavailable, retry slowly instead of opening a
-        # local socket at the sensor-update rate.
+
         now = time.monotonic()
         if last_error and now - last_attempt_at < 2.0:
             continue
+
         last_attempt_at = now
-        result = await _send_matrix_direction(direction)
-        if result.get("sent"):
-            last_direction = direction
-        else:
-            # Retry after the backoff period. Keep local display state unknown.
-            last_direction = None
+        result = await _matrix_render_effective()
+        if result.get("sent") and not result.get("unchanged"):
+            last_attempt_at = 0.0
 
 
 @app.get("/audio/status")
@@ -1054,6 +1385,8 @@ async def audio_status() -> dict[str, Any]:
         "encoding": "pcm_s16le",
         "max_recording_seconds": MAX_AUDIO_SECONDS,
         "max_recording_bytes": MAX_AUDIO_BYTES,
+        "voice_pipeline_queued": VOICE_PIPELINE_QUEUED,
+        "voice_pipeline_max_queue": VOICE_PIPELINE_MAX_QUEUE,
     })
     return result
 
@@ -1097,6 +1430,7 @@ async def phone_websocket(websocket: WebSocket) -> None:
                     outcome = {"ok": False, "error": str(exc)}
 
                 if outcome.get("ok"):
+                    matrix_command = str(outcome.get("matrix_command") or "")
                     transcript = str(outcome.get("text", "")).strip()
                     AUDIO_STATE.update({
                         "last_transcription": transcript,
@@ -1111,155 +1445,38 @@ async def phone_websocket(websocket: WebSocket) -> None:
                     })
                     print(f"[speech] transcription: {transcript!r}")
 
-                    navigation_intent = outcome.get("intent")
-                    if (
-                        isinstance(navigation_intent, dict)
-                        and navigation_intent.get("type") == "find_target"
-                    ):
-                        requested_target = str(
-                            navigation_intent.get("target", "")
-                        ).strip()
-
-                        try:
-                            selected = await target_select(
-                                TargetSelectRequest(target=requested_target)
-                            )
-                            selected_target = selected.get("target") or {}
-                            canonical_name = str(
-                                selected_target.get("name", requested_target)
-                            )
-
-                            # Only start matrix guidance when the calculated target
-                            # direction is valid and the target is above the horizon.
-                            guidance_check = await target_guidance()
-                            auto_follow_enabled = False
-                            matrix_result = None
-
-                            if not guidance_check.get("available"):
-                                response_text = (
-                                    f"{canonical_name} is selected, but guidance "
-                                    "is not ready. "
-                                    + str(guidance_check.get(
-                                        "message", "Check phone telemetry and calibration."
-                                    ))
-                                )
-                            elif guidance_check.get("direction") == "target_below_horizon":
-                                response_text = (
-                                    f"{canonical_name} is selected, but it is "
-                                    "currently below the calculated horizon. "
-                                    "I'll wait until it is above the horizon to guide you."
-                                )
-                            else:
-                                initial_direction = str(
-                                    guidance_check.get("direction", "idle")
-                                )
-                                if initial_direction not in MATRIX_DIRECTIONS:
-                                    response_text = (
-                                        f"{canonical_name} is selected, but the "
-                                        "guidance direction is unsupported by the matrix."
-                                    )
-                                else:
-                                    matrix_result = await _send_matrix_direction(
-                                        initial_direction
-                                    )
-
-                                    if matrix_result.get("sent"):
-                                        await matrix_auto_follow(
-                                            MatrixFollowRequest(enabled=True)
-                                        )
-                                        async with MATRIX_STATE_LOCK:
-                                            auto_follow_enabled = bool(
-                                                MATRIX_STATE["auto_follow_enabled"]
-                                            )
-
-                                        if auto_follow_enabled:
-                                            response_text = (
-                                                f"Finding {canonical_name}. "
-                                                "Move your phone slowly and follow "
-                                                "the direction on the LED matrix."
-                                            )
-                                        else:
-                                            response_text = (
-                                                f"{canonical_name} is selected, "
-                                                "but automatic guidance could not be enabled."
-                                            )
-                                    else:
-                                        response_text = (
-                                            f"{canonical_name} is selected, but "
-                                            "the LED matrix command failed. "
-                                            "Check the matrix bridge."
-                                        )
-
-                            outcome.update({
-                                "response": response_text,
-                                "response_ok": True,
-                                "response_error": None,
-                            })
-                            await websocket.send_json({
-                                "type": "target_selected",
-                                "ok": True,
-                                "target": selected_target,
-                                "auto_follow_enabled": auto_follow_enabled,
-                                "guidance_direction": guidance_check.get("direction"),
-                                "matrix_command_sent": bool(
-                                    matrix_result and matrix_result.get("sent")
-                                ),
-                                "message": response_text,
-                            })
-                            print(
-                                f"[navigation] selected target: {canonical_name}; "
-                                f"auto_follow={auto_follow_enabled}; "
-                                f"guidance={guidance_check.get('direction')}"
-                            )
-
-                        except HTTPException as exc:
-                            detail = str(exc.detail)
-                            if "Unknown target" in detail:
-                                response_text = (
-                                    f"{requested_target} isn't in my supported "
-                                    "bright-star catalogue. Try Betelgeuse, "
-                                    "Sirius, or Vega."
-                                )
-                            else:
-                                response_text = (
-                                    f"I couldn't select {requested_target}. "
-                                    f"{detail}"
-                                )
-                            outcome.update({
-                                "response": response_text,
-                                "response_ok": False,
-                                "response_error": detail,
-                            })
-                            await websocket.send_json({
-                                "type": "target_selection_failed",
-                                "ok": False,
-                                "requested_target": requested_target,
-                                "message": response_text,
-                            })
-                            print(
-                                f"[navigation] selection failed: {detail}"
-                            )
-
-                        tts_started = time.perf_counter()
-                        tts_result = await asyncio.to_thread(
+                    response_text = str(outcome.get("response", "")).strip()
+                    navigation_target = outcome.get("navigation_target")
+                    if navigation_target:
+                        navigation_result = await _activate_voice_navigation(
+                            str(navigation_target)
+                        )
+                        response_text = str(navigation_result.get("response", ""))
+                        outcome["response"] = response_text
+                        outcome["response_ok"] = bool(response_text)
+                        outcome["navigation_result"] = navigation_result
+                        speech_result = await asyncio.to_thread(
                             _run_piper_cli, response_text
                         )
-                        print(
-                            f"[timing] navigation_piper="
-                            f"{time.perf_counter() - tts_started:.2f}s"
-                        )
-                        outcome["speech_ok"] = bool(tts_result.get("ok"))
-                        outcome["speech_error"] = tts_result.get("error")
-                        outcome["speech_sample_rate_hz"] = tts_result.get(
+                        outcome["speech_ok"] = bool(speech_result.get("ok"))
+                        outcome["speech_sample_rate_hz"] = speech_result.get(
                             "sample_rate_hz"
                         )
-                        outcome["speech_duration_seconds"] = tts_result.get(
+                        outcome["speech_duration_seconds"] = speech_result.get(
                             "duration_seconds"
                         )
-                        if tts_result.get("ok"):
-                            outcome["speech_pcm"] = tts_result["pcm"]
+                        outcome["speech_error"] = speech_result.get("error")
+                        if speech_result.get("ok") and isinstance(
+                            speech_result.get("pcm"), bytes
+                        ):
+                            outcome["speech_pcm"] = speech_result["pcm"]
+                        else:
+                            outcome.pop("speech_pcm", None)
+                        print(
+                            "[navigation] voice target activated: "
+                            f"{navigation_result.get('target')}"
+                        )
 
-                    response_text = str(outcome.get("response", "")).strip()
                     if response_text:
                         response_ok = bool(outcome.get("response_ok", True))
                         response_error = outcome.get("response_error")
@@ -1292,6 +1509,11 @@ async def phone_websocket(websocket: WebSocket) -> None:
                                 ),
                             })
 
+                            matrix_speaking = await _matrix_set_activity("speaking")
+                            speech_generation = int(
+                                matrix_speaking.get("activity_generation", -1)
+                            )
+
                             # Android creates an AudioTrack from this sample rate.
                             await websocket.send_json({
                                 "type": "audio_playback_start",
@@ -1301,6 +1523,14 @@ async def phone_websocket(websocket: WebSocket) -> None:
                                 "duration_seconds": round(speech_duration, 3),
                                 "source": "piper_tts",
                             })
+
+                            asyncio.create_task(
+                                _matrix_finish_speaking_after(
+                                    speech_duration,
+                                    speech_generation,
+                                    matrix_command == "easter_egg",
+                                )
+                            )
 
                             for chunk in iter_pcm_chunks(speech_pcm):
                                 await websocket.send_bytes(chunk)
@@ -1320,8 +1550,12 @@ async def phone_websocket(websocket: WebSocket) -> None:
                                 or "Piper returned no audio."
                             )
                             AUDIO_STATE["last_speech_error"] = speech_error
+                            await _matrix_set_activity("idle")
+                            if matrix_command == "easter_egg":
+                                await _matrix_trigger_easter_egg()
                             print(f"[speech] TTS unavailable: {speech_error}")
                 else:
+                    await _matrix_set_activity("idle")
                     error = str(outcome.get("error", "Unknown transcription error"))
                     AUDIO_STATE["last_transcription_error"] = error
                     await websocket.send_json({
@@ -1390,6 +1624,14 @@ async def phone_websocket(websocket: WebSocket) -> None:
                     })
             elif message_type == "ping":
                 await websocket.send_json({"type": "pong", "server_time_unix_ms": int(time.time() * 1000)})
+            elif message_type == "audio_playback_finished":
+                async with MATRIX_STATE_LOCK:
+                    currently_speaking = MATRIX_STATE["activity_mode"] == "speaking"
+                if currently_speaking:
+                    await _matrix_set_activity("idle")
+                await websocket.send_json({
+                    "type": "ack", "message": "Playback completion received."
+                })
             elif message_type == "audio_start":
                 sample_rate = int(message.get("sample_rate_hz", 0))
                 channels = int(message.get("channels", 0))
@@ -1410,7 +1652,9 @@ async def phone_websocket(websocket: WebSocket) -> None:
                     "type": "audio_started", "sample_rate_hz": AUDIO_SAMPLE_RATE_HZ,
                     "channels": AUDIO_CHANNELS, "max_seconds": MAX_AUDIO_SECONDS,
                 })
+                await _matrix_set_activity("listening")
             elif message_type == "audio_stop":
+                global VOICE_PIPELINE_QUEUED
                 if audio_capture is None:
                     await websocket.send_json({"type": "error", "message": "No audio capture is active."})
                     continue
@@ -1422,12 +1666,14 @@ async def phone_websocket(websocket: WebSocket) -> None:
                 if not pcm:
                     AUDIO_STATE["last_error"] = "empty_recording"
                     await websocket.send_json({"type": "error", "message": "No microphone audio was received."})
+                    await _matrix_set_activity("idle")
                     continue
                 try:
                     saved_path = write_pcm_wav(pcm, AUDIO_LATEST_WAV, AUDIO_SAMPLE_RATE_HZ)
                 except Exception as exc:
                     AUDIO_STATE["last_error"] = f"save_failed: {exc}"
                     await websocket.send_json({"type": "error", "message": f"Could not save audio: {exc}"})
+                    await _matrix_set_activity("idle")
                     continue
                 duration = len(pcm) / (AUDIO_SAMPLE_RATE_HZ * AUDIO_CHANNELS * 2)
                 AUDIO_STATE.update({
@@ -1464,21 +1710,37 @@ async def phone_websocket(websocket: WebSocket) -> None:
                 else:
                     print("[audio] microphone echo disabled; proceeding to assistant")
 
-                # Run Whisper concurrently with the ongoing phone telemetry.
+                # Reject a new recording if the previous one is still in flight.
+                if VOICE_PIPELINE_QUEUED >= VOICE_PIPELINE_MAX_QUEUE:
+                    await websocket.send_json({
+                        "type": "busy",
+                        "message": "Still working on the previous question. Try again in a moment.",
+                    })
+                    print("[speech] rejected recording: pipeline busy")
+                    await _matrix_set_activity("idle")
+                    continue
+
+                VOICE_PIPELINE_QUEUED += 1
                 pending_transcriptions.append((
-                    asyncio.create_task(_transcribe_wav_async(saved_path)),
+                    asyncio.create_task(_serialized_voice_pipeline(saved_path)),
                     saved_path,
                     round(duration, 3),
                 ))
-                print(f"[speech] queued transcription for {saved_path}")
+                print(
+                    f"[speech] queued transcription for {saved_path} "
+                    f"(queue depth {VOICE_PIPELINE_QUEUED})"
+                )
+                await _matrix_set_activity("thinking")
             else:
                 await websocket.send_json({
                     "type": "ack", "message_type": message_type,
                     "message": "Message received; this message type is not implemented yet.",
                 })
     except WebSocketDisconnect:
+        await _matrix_set_activity("idle")
         print("[phone] disconnected")
     except Exception as exc:
+        await _matrix_set_activity("idle")
         print(f"[phone] websocket error: {exc!r}")
         try:
             await websocket.close(code=1011, reason="Internal bridge error")
@@ -1486,6 +1748,9 @@ async def phone_websocket(websocket: WebSocket) -> None:
             pass
     finally:
         AUDIO_STATE["capture_active"] = False
+        for task, _, _ in pending_transcriptions:
+            if not task.done():
+                task.cancel()
         async with _state_lock:
             STATE["connected_clients"] = max(0, STATE["connected_clients"] - 1)
 
